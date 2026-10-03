@@ -26,6 +26,17 @@ fn isPrintable(s: []const u8) bool {
     return true;
 }
 
+fn decodeExact(out: []u8, encoded: []const u8) !void {
+    const decoder = base64.standard.Decoder;
+    if (try decoder.calcSizeForSlice(encoded) != out.len) return error.InvalidEncoding;
+    try decoder.decode(out, encoded);
+}
+
+fn nextLine(it: *mem.SplitIterator(u8, .scalar)) ![]const u8 {
+    const line = it.next() orelse return error.InvalidEncoding;
+    return if (mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
+}
+
 pub const Signature = struct {
     arena: heap.ArenaAllocator,
     untrusted_comment: []u8,
@@ -47,33 +58,58 @@ pub const Signature = struct {
         return if (prehashed) .Prehash else .Legacy;
     }
 
-    pub fn decode(child_allocator: mem.Allocator, lines_str: []const u8) !Signature {
-        var arena = heap.ArenaAllocator.init(child_allocator);
-        errdefer arena.deinit();
-        const allocator = arena.allocator();
-        var it = mem.tokenizeScalar(u8, lines_str, '\n');
-        const untrusted_comment = try allocator.dupe(u8, mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n"));
+    /// Parsed wire fields borrowing their comments from the input document.
+    /// Unlike the owned decoder, this view does not impose a printable-text
+    /// policy on comments; their exact bytes are covered by the global signature.
+    pub const View = struct {
+        untrusted_comment: []const u8,
+        signature_algorithm: [2]u8,
+        key_id: [8]u8,
+        signature: [64]u8,
+        trusted_comment: []const u8,
+        global_signature: [64]u8,
+    };
+
+    pub fn decodeView(lines_str: []const u8) !View {
+        var it = mem.splitScalar(u8, lines_str, '\n');
+        const untrusted_comment = try nextLine(&it);
+        if (!mem.startsWith(u8, untrusted_comment, "untrusted comment:")) return error.InvalidEncoding;
         var bin1: [74]u8 = undefined;
-        try base64.standard.Decoder.decode(&bin1, mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n"));
-        const trusted_comment_line = mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n");
-        if (!mem.startsWith(u8, trusted_comment_line, "trusted comment: ")) {
-            return error.InvalidEncoding;
-        }
-        const trusted_comment_raw = trusted_comment_line["trusted comment: ".len..];
-        if (!isPrintable(trusted_comment_raw)) {
-            return error.UnprintableCharacters;
-        }
-        const trusted_comment = try allocator.dupe(u8, trusted_comment_raw);
+        try decodeExact(&bin1, mem.trim(u8, try nextLine(&it), " \t\r\n"));
+        const trusted_comment_line = try nextLine(&it);
+        const trusted_prefix = "trusted comment:";
+        if (!mem.startsWith(u8, trusted_comment_line, trusted_prefix)) return error.InvalidEncoding;
+        var trusted_comment = trusted_comment_line[trusted_prefix.len..];
+        if (mem.startsWith(u8, trusted_comment, " ")) trusted_comment = trusted_comment[1..];
         var bin2: [64]u8 = undefined;
-        try base64.standard.Decoder.decode(&bin2, mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n"));
-        const sig = Signature{
-            .arena = arena,
+        try decodeExact(&bin2, mem.trim(u8, try nextLine(&it), " \t\r\n"));
+        if (mem.trim(u8, it.rest(), " \t\r\n").len != 0) return error.InvalidEncoding;
+        return .{
             .untrusted_comment = untrusted_comment,
             .signature_algorithm = bin1[0..2].*,
             .key_id = bin1[2..10].*,
             .signature = bin1[10..74].*,
             .trusted_comment = trusted_comment,
             .global_signature = bin2,
+        };
+    }
+
+    pub fn decode(child_allocator: mem.Allocator, lines_str: []const u8) !Signature {
+        const view = try decodeView(lines_str);
+        if (!isPrintable(view.trusted_comment)) return error.UnprintableCharacters;
+        var arena = heap.ArenaAllocator.init(child_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const untrusted_comment = try allocator.dupe(u8, view.untrusted_comment);
+        const trusted_comment = try allocator.dupe(u8, view.trusted_comment);
+        const sig = Signature{
+            .arena = arena,
+            .untrusted_comment = untrusted_comment,
+            .signature_algorithm = view.signature_algorithm,
+            .key_id = view.key_id,
+            .signature = view.signature,
+            .trusted_comment = trusted_comment,
+            .global_signature = view.global_signature,
         };
         return sig;
     }
@@ -144,7 +180,7 @@ pub const PublicKey = struct {
             return error.InvalidEncoding;
         }
         var bin: [42]u8 = undefined;
-        try base64.standard.Decoder.decode(&bin, str);
+        try decodeExact(&bin, str);
         const signature_algorithm = bin[0..2];
         if (bin[0] != 0x45 or (bin[1] != 0x64 and bin[1] != 0x44)) {
             return error.UnsupportedAlgorithm;
@@ -171,7 +207,7 @@ pub const PublicKey = struct {
             const encoded_ssh_key = it.next() orelse return error.InvalidEncoding;
             const pk_len = pk.key.len;
             var ssh_key: [4 + key_type.len + 4 + pk_len]u8 = undefined;
-            try base64.standard.Decoder.decode(&ssh_key, encoded_ssh_key);
+            try decodeExact(&ssh_key, encoded_ssh_key);
             if (mem.readInt(u32, ssh_key[0..4], Endian.big) != key_type.len or
                 !mem.eql(u8, ssh_key[4..][0..key_type.len], key_type) or
                 mem.readInt(u32, ssh_key[4 + key_type.len ..][0..4], Endian.big) != pk.key.len)
@@ -231,6 +267,16 @@ pub const PublicKey = struct {
                 .Legacy => .{ .Legacy = try Ed25519.Signature.fromBytes(sig.signature).verifier(ed25519_pk) },
             },
         };
+    }
+
+    /// Verify the signature binding the artifact signature to its exact
+    /// trusted-comment bytes, independently of artifact verification.
+    pub fn verifyGlobal(self: *const PublicKey, sig: *const Signature) !void {
+        const pk = try Ed25519.PublicKey.fromBytes(self.key);
+        var global = try Ed25519.Signature.fromBytes(sig.global_signature).verifier(pk);
+        global.update(&sig.signature);
+        global.update(sig.trusted_comment);
+        try global.verify();
     }
 
     pub fn verifyFile(self: PublicKey, allocator: std.mem.Allocator, io: Io, fd: File, sig: Signature, prehash: ?bool) !void {
@@ -325,7 +371,7 @@ pub const Verifier = struct {
         }
     }
 
-    pub fn verify(self: *Verifier, allocator: std.mem.Allocator) !void {
+    pub fn verifyArtifact(self: *Verifier) !void {
         const ed25519_pk = try Ed25519.PublicKey.fromBytes(self.pk.key);
         switch (self.format) {
             .Prehash => |*prehash| {
@@ -339,7 +385,11 @@ pub const Verifier = struct {
                 try legacy.verify();
             },
         }
+    }
 
+    pub fn verify(self: *Verifier, allocator: std.mem.Allocator) !void {
+        try self.verifyArtifact();
+        const ed25519_pk = try Ed25519.PublicKey.fromBytes(self.pk.key);
         var global = try allocator.alloc(u8, self.sig.signature.len + self.sig.trusted_comment.len);
         defer allocator.free(global);
         @memcpy(global[0..self.sig.signature.len], self.sig.signature[0..]);
@@ -360,6 +410,7 @@ pub const SecretKey = struct {
     key_id: [8]u8,
     secret_key: [64]u8,
     checksum: [32]u8,
+    decrypted: bool = false,
 
     pub fn deinit(self: *SecretKey) void {
         crypto.secureZero(u8, &self.secret_key);
@@ -372,17 +423,21 @@ pub const SecretKey = struct {
         errdefer arena.deinit();
         const allocator = arena.allocator();
 
-        var it = mem.tokenizeScalar(u8, lines_str, '\n');
-        const untrusted_comment = try allocator.dupe(u8, mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n"));
-
-        const encoded_key = mem.trim(u8, it.next() orelse return error.InvalidEncoding, " \t\r\n");
+        var it = mem.splitScalar(u8, mem.trim(u8, lines_str, " \t\r\n"), '\n');
+        const first = try nextLine(&it);
+        const has_comment = mem.startsWith(u8, first, "untrusted comment:");
+        const comment = if (has_comment) first else "";
+        const encoded_key = mem.trim(u8, if (has_comment) try nextLine(&it) else first, " \t\r\n");
+        if (mem.trim(u8, it.rest(), " \t\r\n").len != 0) return error.InvalidEncoding;
+        const untrusted_comment = try allocator.dupe(u8, comment);
 
         // The secret key structure is 158 bytes total:
         // 2 (sig_alg) + 2 (kdf_alg) + 2 (chk_alg) + 32 (salt) + 8 (opslimit) + 8 (memlimit) + 8 (keynum) + 64 (sk) + 32 (chk) = 158 bytes
         // The encrypted part is: 8 (keynum) + 64 (sk) + 32 (chk) = 104 bytes
         // Total in file: 2 + 2 + 2 + 32 + 8 + 8 + 104 = 158 bytes
         var bin: [158]u8 = undefined;
-        try base64.standard.Decoder.decode(&bin, encoded_key);
+        defer crypto.secureZero(u8, &bin);
+        try decodeExact(&bin, encoded_key);
 
         var sk = SecretKey{
             .arena = arena,
@@ -397,6 +452,10 @@ pub const SecretKey = struct {
             .secret_key = bin[62..126].*,
             .checksum = bin[126..158].*,
         };
+        errdefer {
+            crypto.secureZero(u8, &sk.secret_key);
+            crypto.secureZero(u8, &sk.checksum);
+        }
 
         if (!mem.eql(u8, &sk.signature_algorithm, "Ed")) {
             return error.UnsupportedAlgorithm;
@@ -404,6 +463,7 @@ pub const SecretKey = struct {
         if (!mem.eql(u8, &sk.checksum_algorithm, "B2")) {
             return error.UnsupportedChecksumAlgorithm;
         }
+        sk.decrypted = mem.eql(u8, &sk.kdf_algorithm, "\x00\x00");
 
         return sk;
     }
@@ -414,11 +474,13 @@ pub const SecretKey = struct {
         var file_reader = fd.reader(io, &.{});
         const sk_str = try file_reader.interface.allocRemaining(allocator, .limited(4096));
         defer allocator.free(sk_str);
+        defer crypto.secureZero(u8, sk_str);
         return SecretKey.decode(allocator, sk_str);
     }
 
     fn xorData(self: *SecretKey, stream: []const u8) void {
         var data: [104]u8 = undefined;
+        defer crypto.secureZero(u8, &data);
         @memcpy(data[0..8], &self.key_id);
         @memcpy(data[8..72], &self.secret_key);
         @memcpy(data[72..104], &self.checksum);
@@ -431,19 +493,26 @@ pub const SecretKey = struct {
     }
 
     pub fn decrypt(self: *SecretKey, allocator: mem.Allocator, password: []const u8) !void {
-        if (mem.eql(u8, &self.kdf_algorithm, "\x00\x00")) return;
+        if (self.decrypted) return;
+        if (mem.eql(u8, &self.kdf_algorithm, "\x00\x00")) {
+            self.decrypted = true;
+            return;
+        }
         if (!mem.eql(u8, &self.kdf_algorithm, "Sc")) return error.UnsupportedKdfAlgorithm;
+        const mem_limit = math.cast(usize, self.kdf_memlimit) orelse return error.WeakParameters;
+        if (mem_limit < 2048) return error.WeakParameters;
 
         var stream: [104]u8 = undefined;
         defer crypto.secureZero(u8, &stream);
 
-        const params = crypto.pwhash.scrypt.Params.fromLimits(self.kdf_opslimit, @intCast(self.kdf_memlimit));
+        const params = crypto.pwhash.scrypt.Params.fromLimits(self.kdf_opslimit, mem_limit);
         try crypto.pwhash.scrypt.kdf(allocator, &stream, password, &self.kdf_salt, params);
 
         var decrypted_key_id = self.key_id;
         var decrypted_secret_key = self.secret_key;
         defer crypto.secureZero(u8, &decrypted_secret_key);
         var decrypted_checksum = self.checksum;
+        defer crypto.secureZero(u8, &decrypted_checksum);
 
         for (&decrypted_key_id, stream[0..8]) |*byte, key| byte.* ^= key;
         for (&decrypted_secret_key, stream[8..72]) |*byte, key| byte.* ^= key;
@@ -451,6 +520,7 @@ pub const SecretKey = struct {
 
         // Verify checksum before mutating the stored encrypted fields.
         var computed_checksum: [32]u8 = undefined;
+        defer crypto.secureZero(u8, &computed_checksum);
         var hasher = Blake2b256.init(.{});
         hasher.update(&self.signature_algorithm);
         hasher.update(&decrypted_key_id);
@@ -464,6 +534,7 @@ pub const SecretKey = struct {
         self.key_id = decrypted_key_id;
         self.secret_key = decrypted_secret_key;
         self.checksum = decrypted_checksum;
+        self.decrypted = true;
     }
 
     pub fn signFile(
@@ -474,6 +545,7 @@ pub const SecretKey = struct {
         prehash: bool,
         trusted_comment: []const u8,
     ) !Signature {
+        if (!self.decrypted and !mem.eql(u8, &self.kdf_algorithm, "\x00\x00")) return error.KeyNotDecrypted;
         if (!prehash) return error.LegacySigningNotImplemented;
 
         var message: [64]u8 = undefined;
@@ -488,11 +560,8 @@ pub const SecretKey = struct {
         }
         hasher.final(&message);
 
-        const ed25519_sk = Ed25519.SecretKey{ .bytes = self.secret_key };
-        const keypair = Ed25519.KeyPair{
-            .public_key = try Ed25519.PublicKey.fromBytes(ed25519_sk.publicKeyBytes()),
-            .secret_key = ed25519_sk,
-        };
+        var keypair = try Ed25519.KeyPair.fromSecretKey(try Ed25519.SecretKey.fromBytes(self.secret_key));
+        defer crypto.secureZero(u8, &keypair.secret_key.bytes);
 
         const sig_bytes = try keypair.sign(&message, null);
 
@@ -503,14 +572,16 @@ pub const SecretKey = struct {
 
         var sig_arena = heap.ArenaAllocator.init(allocator);
         errdefer sig_arena.deinit();
+        const untrusted = try sig_arena.allocator().dupe(u8, "");
+        const trusted = try sig_arena.allocator().dupe(u8, trusted_comment);
 
         return Signature{
             .arena = sig_arena,
-            .untrusted_comment = try sig_arena.allocator().dupe(u8, ""),
+            .untrusted_comment = untrusted,
             .signature_algorithm = "ED".*,
             .key_id = self.key_id,
             .signature = sig_bytes.toBytes(),
-            .trusted_comment = try sig_arena.allocator().dupe(u8, trusted_comment),
+            .trusted_comment = trusted,
             .global_signature = (try keypair.sign(global_data, null)).toBytes(),
         };
     }
@@ -526,17 +597,20 @@ pub const SecretKey = struct {
 
     pub fn generate(allocator: mem.Allocator, io: std.Io) !SecretKey {
         // Generate Ed25519 keypair
-        const keypair = Ed25519.KeyPair.generate(io);
+        var keypair = Ed25519.KeyPair.generate(io);
+        defer crypto.secureZero(u8, &keypair.secret_key.bytes);
 
         // Generate random key ID
         var key_id: [8]u8 = undefined;
         io.random(&key_id);
 
         // The Ed25519 secret key already contains seed (32) + public key (32) = 64 bytes
-        const secret_key = keypair.secret_key.bytes;
+        var secret_key = keypair.secret_key.bytes;
+        defer crypto.secureZero(u8, &secret_key);
 
         // Compute checksum: Blake2b-256(signature_algorithm || key_id || secret_key)
         var checksum: [32]u8 = undefined;
+        defer crypto.secureZero(u8, &checksum);
         var hasher = Blake2b256.init(.{});
         const sig_alg = "Ed".*;
         hasher.update(&sig_alg);
@@ -546,10 +620,11 @@ pub const SecretKey = struct {
 
         var arena = heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
+        const untrusted_comment = try arena.allocator().dupe(u8, "untrusted comment: minisign encrypted secret key");
 
         return SecretKey{
             .arena = arena,
-            .untrusted_comment = try arena.allocator().dupe(u8, "untrusted comment: minisign encrypted secret key"),
+            .untrusted_comment = untrusted_comment,
             .signature_algorithm = sig_alg,
             .kdf_algorithm = "\x00\x00".*, // Unencrypted by default
             .checksum_algorithm = "B2".*,
@@ -559,6 +634,7 @@ pub const SecretKey = struct {
             .key_id = key_id,
             .secret_key = secret_key,
             .checksum = checksum,
+            .decrypted = true,
         };
     }
 
@@ -581,6 +657,7 @@ pub const SecretKey = struct {
 
         self.xorData(&stream);
         self.kdf_algorithm = "Sc".*;
+        self.decrypted = false;
     }
 
     pub fn toFile(self: *const SecretKey, io: Io, path: []const u8) !void {
@@ -595,6 +672,7 @@ pub const SecretKey = struct {
         defer atomic.deinit(io);
 
         var buf: [4096]u8 = undefined;
+        defer crypto.secureZero(u8, &buf);
         var file_writer = atomic.file.writer(io, &buf);
         const writer = &file_writer.interface;
 
@@ -602,6 +680,7 @@ pub const SecretKey = struct {
         try writer.writeAll("\n");
 
         var bin: [158]u8 = undefined;
+        defer crypto.secureZero(u8, &bin);
         @memcpy(bin[0..2], &self.signature_algorithm);
         @memcpy(bin[2..4], &self.kdf_algorithm);
         @memcpy(bin[4..6], &self.checksum_algorithm);
@@ -614,6 +693,7 @@ pub const SecretKey = struct {
 
         const Base64Encoder = base64.standard.Encoder;
         var encoded: [Base64Encoder.calcSize(158)]u8 = undefined;
+        defer crypto.secureZero(u8, &encoded);
         _ = Base64Encoder.encode(&encoded, &bin);
         try writer.writeAll(&encoded);
         try writer.writeAll("\n");
@@ -622,3 +702,110 @@ pub const SecretKey = struct {
         try atomic.replace(io);
     }
 };
+
+test "fixed-size decoders reject truncated, oversized and trailing records" {
+    const testing = std.testing;
+    const public_key = "RWQf2YpvkVxNbvjCrthM42frjc/tf26hSzWpOhbD2NqPNqbxcPSLp1fJ";
+    try testing.expectError(error.InvalidEncoding, PublicKey.decodeFromBase64(public_key[0..55] ++ "="));
+    var raw: [158]u8 = @splat(0);
+    @memcpy(raw[0..2], "Ed");
+    @memcpy(raw[4..6], "B2");
+    var encoded: [base64.standard.Encoder.calcSize(raw.len)]u8 = undefined;
+    _ = base64.standard.Encoder.encode(&encoded, &raw);
+    var sk = try SecretKey.decode(testing.allocator, &encoded);
+    defer sk.deinit();
+    const key_file = try testing.allocator.print("untrusted comment: key\r\n{s}\r\n", .{encoded});
+    defer testing.allocator.free(key_file);
+    var sk_file = try SecretKey.decode(testing.allocator, key_file);
+    defer sk_file.deinit();
+    try testing.expectError(error.InvalidEncoding, SecretKey.decode(testing.allocator, encoded[0..208]));
+    const oversized_key: [216]u8 = @splat('A');
+    try testing.expectError(error.InvalidEncoding, SecretKey.decode(testing.allocator, &oversized_key));
+    const extra = try testing.allocator.print("{s}extra\n", .{key_file});
+    defer testing.allocator.free(extra);
+    try testing.expectError(error.InvalidEncoding, SecretKey.decode(testing.allocator, extra));
+    const oversized_sig: [104]u8 = @splat('A');
+    var valid_sig: [100]u8 = @splat('A');
+    valid_sig[99] = '=';
+    var valid_global: [88]u8 = @splat('A');
+    @memcpy(valid_global[86..], "==");
+    for ([_][]const u8{ "AAAA", &oversized_sig }) |sig_token| {
+        const doc = try testing.allocator.print("untrusted comment: key\n{s}\ntrusted comment: ok\n{s}\n", .{ sig_token, valid_global });
+        defer testing.allocator.free(doc);
+        try testing.expectError(error.InvalidEncoding, Signature.decode(testing.allocator, doc));
+    }
+    const short_global = try testing.allocator.print("untrusted comment: key\n{s}\ntrusted comment: ok\nAAAA\n", .{valid_sig});
+    defer testing.allocator.free(short_global);
+    try testing.expectError(error.InvalidEncoding, Signature.decode(testing.allocator, short_global));
+    const extra_sig = try testing.allocator.print("untrusted comment: key\n{s}\ntrusted comment: ok\n{s}\nextra\n", .{ valid_sig, valid_global });
+    defer testing.allocator.free(extra_sig);
+    try testing.expectError(error.InvalidEncoding, Signature.decode(testing.allocator, extra_sig));
+}
+
+test "borrowed and owned signatures preserve signed whitespace and separate verification" {
+    const testing = std.testing;
+    var sk = try SecretKey.generate(testing.allocator, testing.io);
+    defer sk.deinit();
+    const pk = sk.getPublicKey();
+    var kp = try Ed25519.KeyPair.fromSecretKey(try Ed25519.SecretKey.fromBytes(sk.secret_key));
+    defer crypto.secureZero(u8, &kp.secret_key.bytes);
+    const message = "legacy streaming artifact";
+    const trusted = " \t release:v1 \t";
+    const artifact_sig = (try kp.sign(message, null)).toBytes();
+    var global_input: [64 + trusted.len]u8 = undefined;
+    @memcpy(global_input[0..64], &artifact_sig);
+    @memcpy(global_input[64..], trusted);
+    const global_sig = (try kp.sign(&global_input, null)).toBytes();
+    var raw: [74]u8 = undefined;
+    @memcpy(raw[0..2], "Ed");
+    @memcpy(raw[2..10], &sk.key_id);
+    @memcpy(raw[10..], &artifact_sig);
+    var sig_b64: [base64.standard.Encoder.calcSize(74)]u8 = undefined;
+    var global_b64: [base64.standard.Encoder.calcSize(64)]u8 = undefined;
+    _ = base64.standard.Encoder.encode(&sig_b64, &raw);
+    _ = base64.standard.Encoder.encode(&global_b64, &global_sig);
+    const doc = try testing.allocator.print("untrusted comment: test\r\n{s}\r\ntrusted comment: {s}\r\n{s}\r\n", .{ sig_b64, trusted, global_b64 });
+    defer testing.allocator.free(doc);
+    const view = try Signature.decodeView(doc);
+    try testing.expectEqualStrings(trusted, view.trusted_comment);
+    var sig = try Signature.decode(testing.allocator, doc);
+    defer sig.deinit();
+    try testing.expectEqualStrings(trusted, sig.trusted_comment);
+    var verifier = try pk.verifier(&sig);
+    verifier.update(message[0..7]);
+    verifier.update(message[7..]);
+    try verifier.verifyArtifact();
+    try pk.verifyGlobal(&sig);
+    sig.trusted_comment[sig.trusted_comment.len - 1] = ' ';
+    try testing.expectError(error.SignatureVerificationFailed, pk.verifyGlobal(&sig));
+}
+
+test "encrypted keys reject signing, preserve failed retries and decrypt once" {
+    const testing = std.testing;
+    var sk = try SecretKey.generate(testing.allocator, testing.io);
+    defer sk.deinit();
+    const original_secret = sk.secret_key;
+    const original_id = sk.key_id;
+    sk.kdf_algorithm = "Sc".*;
+    sk.kdf_opslimit = 32768;
+    sk.kdf_memlimit = 2048;
+    sk.decrypted = false;
+    var stream: [104]u8 = undefined;
+    defer crypto.secureZero(u8, &stream);
+    try crypto.pwhash.scrypt.kdf(testing.allocator, &stream, "password", &sk.kdf_salt, crypto.pwhash.scrypt.Params.fromLimits(sk.kdf_opslimit, 2048));
+    sk.xorData(&stream);
+    const encrypted = sk.secret_key;
+    try testing.expectError(error.KeyNotDecrypted, sk.signFile(testing.allocator, testing.io, undefined, true, ""));
+    sk.kdf_memlimit = 0;
+    try testing.expectError(error.WeakParameters, sk.decrypt(testing.allocator, "password"));
+    sk.kdf_memlimit = 2048;
+    try testing.expectError(error.WrongPassword, sk.decrypt(testing.allocator, "wrong"));
+    try testing.expectEqualSlices(u8, &encrypted, &sk.secret_key);
+    try testing.expect(!sk.decrypted);
+    try sk.decrypt(testing.allocator, "password");
+    try testing.expect(sk.decrypted);
+    try testing.expectEqualSlices(u8, &original_secret, &sk.secret_key);
+    try testing.expectEqualSlices(u8, &original_id, &sk.key_id);
+    try sk.decrypt(testing.allocator, "password");
+    try testing.expectEqualSlices(u8, &original_secret, &sk.secret_key);
+}
