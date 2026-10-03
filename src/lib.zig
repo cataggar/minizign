@@ -180,7 +180,7 @@ pub const PublicKey = struct {
             return error.InvalidEncoding;
         }
         var bin: [42]u8 = undefined;
-        try base64.standard.Decoder.decode(&bin, str);
+        try decodeExact(&bin, str);
         const signature_algorithm = bin[0..2];
         if (bin[0] != 0x45 or (bin[1] != 0x64 and bin[1] != 0x44)) {
             return error.UnsupportedAlgorithm;
@@ -207,7 +207,7 @@ pub const PublicKey = struct {
             const encoded_ssh_key = it.next() orelse return error.InvalidEncoding;
             const pk_len = pk.key.len;
             var ssh_key: [4 + key_type.len + 4 + pk_len]u8 = undefined;
-            try base64.standard.Decoder.decode(&ssh_key, encoded_ssh_key);
+            try decodeExact(&ssh_key, encoded_ssh_key);
             if (mem.readInt(u32, ssh_key[0..4], Endian.big) != key_type.len or
                 !mem.eql(u8, ssh_key[4..][0..key_type.len], key_type) or
                 mem.readInt(u32, ssh_key[4 + key_type.len ..][0..4], Endian.big) != pk.key.len)
@@ -705,6 +705,8 @@ pub const SecretKey = struct {
 
 test "fixed-size decoders reject truncated, oversized and trailing records" {
     const testing = std.testing;
+    const public_key = "RWQf2YpvkVxNbvjCrthM42frjc/tf26hSzWpOhbD2NqPNqbxcPSLp1fJ";
+    try testing.expectError(error.InvalidEncoding, PublicKey.decodeFromBase64(public_key[0..55] ++ "="));
     var raw: [158]u8 = @splat(0);
     @memcpy(raw[0..2], "Ed");
     @memcpy(raw[4..6], "B2");
